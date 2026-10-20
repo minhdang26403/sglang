@@ -69,6 +69,14 @@ class PrefillBudget:
         self.allocator = allocator
         self.tree_cache = tree_cache
         self.page_size = allocator.page_size
+        # We separate memory checking into two distinct horizons:
+        # 1. Immediate Allocation ('current_offset'): Tracks the exact number of
+        #    physical KV slots that will be written during this forward execution.
+        # 2. Lifetime Headroom Reservation ('total_offset'): Tracks the aggregate token
+        #    reservation across the entire remaining lifetime of all active and newly
+        #    admitted requests.
+        # Both offsets start at 'num_mixed_decode_tokens' to account for decode requests
+        # that are mixed in this prefill batch (if applicable).
         self.total_offset = num_mixed_decode_tokens
         self.current_offset = num_mixed_decode_tokens
         self.swa_offset = 0

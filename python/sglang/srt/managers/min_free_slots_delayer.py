@@ -35,4 +35,5 @@ class MinFreeSlotsDelayer:
         self._min_free_slots = min_free_slots
 
     def should_delay(self, *, running_bs: int, num_allocatable_reqs: int) -> bool:
+        # If the running decode batch is empty, do not delay any prefill work.
         return running_bs > 0 and num_allocatable_reqs < self._min_free_slots

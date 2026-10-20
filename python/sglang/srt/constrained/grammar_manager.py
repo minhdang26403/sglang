@@ -6,7 +6,6 @@ from concurrent import futures
 from typing import TYPE_CHECKING, List
 
 import torch
-
 from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
     create_grammar_backend,
@@ -174,12 +173,15 @@ class GrammarManager:
                     thinking_budget=self._get_request_thinking_budget(req),
                 )
 
+                # Check if the compiled grammar template is in cache or not.
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
                     key, req.require_reasoning
                 )
                 req.grammar = value
 
                 if not cache_hit:
+                    # If not, add the request to grammar queue while waiting for the
+                    # grammar to be compiled.
                     req.grammar_key = key
                     add_to_grammar_queue = True
                 else:

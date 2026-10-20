@@ -122,6 +122,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
         context = zmq.Context(2)
+        # In multi-detokenizer mode, `detokenizer_ipc_name` is the private IPC
+        # name known only to the detokenizer router. Leader scheduler of each
+        # DP replica will push result to the router, which in turn routes the
+        # result to a detokenizer worker.
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )

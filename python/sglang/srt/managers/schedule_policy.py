@@ -40,7 +40,6 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
-
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.schedule_batch import (
     Req,
@@ -222,10 +221,19 @@ class SchedulePolicy:
             and self.tree_cache.supports_fast_match_prefix()
             and get_disagg().disaggregation_mode != "decode"
         ):
+            # Even for cache-agnostic policies, calculating number of matched prefix
+            # tokens is still useful for reporting worker's load (/v1/loads) to the load
+            # balancer. Hence, we will do so if matching prefix is fatst.
+            # In PD disaggregation mode, decode node never runs prefill for waiting
+            # requests. It only receives pre-computed KV transfers over RDMA.
+            # Calculating prefill prefix hits on a decode node is meaningless.
             for r in waiting_queue:
                 match_kv_cache(r, self.tree_cache)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
+            # Because new requests are appended in FIFO order, 'self.waiting_queue' is
+            # already sorted by arrival time (FCFS) by default. If 'priority_scheduling'
+            # is enabled, we sort it by priority and tie-break by arrival time.
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
@@ -344,12 +352,15 @@ class SchedulePolicy:
         self, waiting_queue: List[Req], policy: CacheAwarePolicy
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
+        # This tree is used for each batch, so need to reset it every time we use it.
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
+            # This computes 'num_matched_prefix_tokens' for each request, which will be
+            # used to sort requests based on its prefix length.
             match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -359,7 +370,16 @@ class SchedulePolicy:
             # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
+
+            # If a request already matched a large number of tokens in the GPU cache, it
+            # is already getting a real cache hit. There is no need to delay it. We only
+            # care about requests that suffered a cache miss or a negligible hit
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+                # In-batch prefix caching prevents the engine from redundantly computing
+                # the exact same uncached prompt multiple times across concurrent
+                # requests. In such case, we should schedule only one pioneer request
+                # first, and temporarily deprioritize the rest until the pioneer writes
+                # the KV cache into GPU VRAM.
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(
@@ -377,8 +397,11 @@ class SchedulePolicy:
                     match_result.device_prefix_len
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
                 ):
+                    # If the overlap between prompts is large enough, delay scheduling
+                    # this request and wait for another request to fill the KV cache.
                     temporary_deprioritized.add(r.rid)
                 else:
+                    # If the match length is too small, we will schedule it anyway
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
@@ -494,6 +517,11 @@ class SchedulePolicy:
         waiting_queue: List[Req], tree_cache: BasePrefixCache
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
+        # 'DFS_WEIGHT' is designed to solve a fundamental flaw of greedy prefix matching
+        # (LPM): cache thrashing caused by branch ping-ponging. Instead of sorting
+        # requests strictly by the number of matched tokens in isolation, 'DFS_WEIGHT'
+        # schedules requests by traversing the Radix tree depth-first, always choosing
+        # the branch that serves the largest cluster of waiting requests.
         order = tree_cache.dfs_weight_order([req.last_node for req in waiting_queue])
         waiting_queue[:] = [waiting_queue[index] for index in order]
 
@@ -504,6 +532,9 @@ class SchedulePolicy:
         priority_sign: int,
     ) -> None:
         """Sorts the waiting queue based on the longest output (max_new_tokens). If using priority scheduling, sort by priority first."""
+        # The idea behind this is that we want to move the long output request to the
+        # decode phase as soon as possible. However, 'max_new_tokens' is just a rough
+        # estimate, not a true output count.
         if enable_priority_scheduling:
             waiting_queue.sort(
                 key=lambda x: (
@@ -524,6 +555,9 @@ class SchedulePolicy:
         waiting_queue: List[Req], priority_sign: int
     ) -> None:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
+        # If low value indicates high priority, 'priority_sign = 1' so low value comes
+        # first. If high value indicates high priority, 'priority_sign = -1' so high
+        # value comes first (large negative -> small).
         waiting_queue.sort(
             key=lambda x: (
                 x.priority * priority_sign,
@@ -605,7 +639,11 @@ class PrefillAdder:
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
+        # The ratio between the number of actual decoded tokens and the theoretical max
+        # number of output tokens.
         self.new_token_ratio = new_token_ratio
+        # We need to subtract the budget by 'num_mixed_decode_tokens' to account for
+        # active decode requests.
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
@@ -623,6 +661,8 @@ class PrefillAdder:
             self._init_dllm_meta(dllm_config)
 
         if self.rem_chunk_tokens is not None:
+            # Need to update the chunk prefill token budget to account for active decode
+            # requests in mixed batching mode.
             self.rem_chunk_tokens -= num_mixed_decode_tokens
         self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
             tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
@@ -643,6 +683,8 @@ class PrefillAdder:
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
+            # Compute the reserved decode headroom by summing the future token demand of
+            # every running decode request.
             self.memory_budget.total_offset += sum(
                 [
                     self._get_running_request_total_token_offset(r)
@@ -756,6 +798,9 @@ class PrefillAdder:
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         # Fixed-length requests cannot benefit from the early-EOS estimate.
         ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
+        # We don't want the scheduler to be too conservative about future token demand,
+        # i.e., estimate a very large number of output tokens, so we set the max to
+        # 'CLIP_MAX_NEW_TOKENS', which is 4096 by default.
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
@@ -879,6 +924,7 @@ class PrefillAdder:
             raw_extend_input_len if self.exact_chunk_fill else extend_input_len
         ) + replay_len
 
+        # Update the memory budget ('current_offset' and 'total_offset').
         self.memory_budget.reserve(
             extend_input_len,
             max_new_tokens,
@@ -1699,6 +1745,7 @@ class PrefillAdder:
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
+                # Release the budget allocated for a decode request once it is evicted.
                 self.memory_budget.total_offset -= (
                     self._get_running_request_total_token_offset(running_req)
                 )

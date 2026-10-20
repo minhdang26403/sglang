@@ -11,6 +11,12 @@ if TYPE_CHECKING:
 
 
 class SchedulerRecvSkipper:
+    """
+    Executing socket polling and CPU Gloo synchronization too frequently wastes
+    host CPU cycles and introduces CPU scheduling jitter. If one CPU core
+    experiences a micro-stall (e.g., OS thread descheduling), all other GPUs
+    stall waiting on the Gloo broadcast, producing a GPU bubble.
+    """
     @staticmethod
     def maybe_create():
         if get_schedule().scheduler_recv_interval <= 1:
@@ -25,6 +31,11 @@ class SchedulerRecvSkipper:
             ForwardMode.IDLE.value,
             ForwardMode.PREBUILT.value,
         }
+        # In Attention Data Parallelism (Attn-DP), DP Rank 0 might be actively
+        # decoding, while DP Rank 1 is idle or extending. If each rank used its
+        # local forward mode to decide whether to skip, Rank 0 might decide to
+        # skip, while Rank 1 decides to poll and calls. Rank 1 enters the Gloo
+        # broadcast waiting for Rank 0; Rank 0 never enters. The cluster deadlocks.
         if not active:
             return None  # globally idle: same bucket as "no last batch"
         if active - {ForwardMode.DECODE.value, ForwardMode.TARGET_VERIFY.value}:
@@ -58,6 +69,18 @@ class SchedulerRecvSkipper:
     def handle(self, last_batch: Optional[ScheduleBatch]) -> bool:
         should_recv = False
 
+        # Instead of polling on every step, SchedulerRecvSkipper throttles
+        # ingress using a weighted counter:
+        # - DECODE (Fast iterations): Has a smaller weight (or higher interval
+        # threshold). SGLang might check for new incoming requests only once
+        # every 4 or 8 decode steps. This lets the engine run a string of
+        # back-to-back decode steps with zero IPC or Gloo overhead.
+        # - EXTEND (Prefill / Prompts): Prefill forward passes take much longer
+        # (e.g., 20–100 ms). You don't need to skip because the CPU has plenty
+        # of headroom while the GPU computes dense GEMMs.
+        # - None (Idle): When the engine is idle, last_weight triggers immediate
+        # polling (since default weight is much larger than the threshold) so
+        # incoming requests are picked up without added latency.
         last_weight = self._weight_of_forward_mode.get(
             self._pick_mode(last_batch), self._default_weight
         )

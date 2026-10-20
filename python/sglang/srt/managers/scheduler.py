@@ -1308,6 +1308,8 @@ class Scheduler(
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
+        # This is the persistent pool of active decode requests. Requests are be moved
+        # to this batch after finishing its prefill (extend) phase.
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
@@ -1351,6 +1353,12 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
+        # NOTE: SGLang maintains at most one active, partially-completed chunked prefill
+        # request (self.chunked_req) at any given moment.
+        # 'self.chunked_req' is reserved strictly for the overflow boundary: When the
+        # scheduler is packing requests into a batch and hits a request that cannot
+        # entirely within the remaining token budget, it slices that request. The head
+        # goes into the batch, and the tail becomes 'self.chunked_req'.
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
@@ -1361,7 +1369,25 @@ class Scheduler(
         """Profile a PP prefill latency model that sizes chunks per stage."""
         self.dynamic_chunk_sizer: Optional[DynamicChunkSizer] = None
         if not (get_schedule().enable_dynamic_chunking and get_parallel().pp_size > 1):
+            # In non-PP setups, the scheduler always falls back to the static
+            # 'self.chunked_prefill_size'.
             return
+
+        # DynamicChunkSizer exists to eliminate pipeline bubbles caused by attention
+        # latency drift as context grows.
+        # In Pipeline Parallelism, different microbatches rotate across pipeline stages.
+        # To keep the pipeline saturated without idle stalls, every stage must take
+        # roughly the same amount of execution time per microbatch step.
+        # A static chunk size breaks this balance completely due to the mechanics of
+        # attention. When running chunked prefill, a chunk of size C must compute
+        # attention against all previously computed tokens plus its own chunk tokens.
+        # If you use a static chunk size (e.g., C = 512):
+        # Chunk 1  (H = 0):      Attend 512 queries over 512 keys    ──> Latency: ~3 ms
+        # Chunk 5  (H = 4,000):  Attend 512 queries over 4,512 keys  ──> Latency: ~8 ms
+        # Chunk 20 (H = 32,000): Attend 512 queries over 32,512 keys ──> Latency: ~24 ms
+        # Even though the chunk size C is identical, Chunk 20 takes 8× longer to execute
+        # than Chunk 1 because of the memory-bandwidth-bound attention scan over the
+        # historical KV cache.
         sizer = DynamicChunkSizer(
             model_runner=self.tp_worker.model_runner,
             model_config=self.model_config,
@@ -1968,8 +1994,17 @@ class Scheduler(
         ev = runner.shared_read_done_event
         runner.shared_read_done_event = None
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
+            # Fine-Grained Barrier
+            # A transformer forward pass might take 30 ms across 80 layers, but
+            # the model reads the shared input buffers only during the first
+            # 0.5 ms (embedding lookup and layer 0 input setup). Therefore, we
+            # only need to wait for the 'read-done' event to be recorded on the
+            # forward stream.
             self.schedule_stream.wait_event(ev)
         else:
+            # Coarse Fallback
+            # Wait until the entire previous forward pass finishes before
+            # executing any buffer writes.
             self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()
@@ -1989,12 +2024,15 @@ class Scheduler(
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
+            # Update the current "running batch" - set of all requests that have
+            # been admitted to the engine.
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
+                # Block until the forward pass computation finishes.
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -2149,6 +2187,8 @@ class Scheduler(
             and get_parallel().attn_tp_rank == 0
             and get_parallel().attn_cp_rank == 0
         ):
+            # Only leader rank of each independent scheduling domain (i.e., each
+            # DP or Attention-DP replica) generates abort events.
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
         self._deferred_input_requests.extend(
@@ -2188,6 +2228,9 @@ class Scheduler(
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
             # Skip health check when server is busy — ongoing requests already carry health info.
+            # The engine runs a dummy forward pass to perform health check. If
+            # there are ongoing requests, we can skip this health check request
+            # and return early.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
@@ -2202,7 +2245,13 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
+                # Work requests return None. They are converted into Req objects
+                # and appended to self.waiting_queue. Only control requests
+                # return output objects.
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
+                    # Embedded Rust server: every control-request response goes
+                    # back through the egress ring (the zmq tokenizer socket is
+                    # not consumed); the Rust api_server shapes it per-endpoint.
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
                 else:
@@ -2655,6 +2704,7 @@ class Scheduler(
             self.max_total_num_tokens * self.kv_shard_widening
             - self.page_size * (self.kv_shard_widening - 1)
         )
+        # Get the actual max number of new tokens given the current GPU memory budget.
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
@@ -2909,6 +2959,9 @@ class Scheduler(
             recv_req.session_id is not None and self.enable_session_radix_cache
         )
 
+        # NOTE: Either 'recv_req.session_params.id' or 'recv_req.session_id' is set, not
+        # both. Hence, it's enough to check for 'session_id is None'.
+
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
             if recv_req.input_embeds is not None:
@@ -2917,6 +2970,8 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
+            # With no session id or even with radix-native session, the user must send
+            # full prompt.
             req = self._create_generation_req(
                 recv_req,
                 recv_req.rid,
@@ -2968,14 +3023,23 @@ class Scheduler(
             req.tokenizer = self.tokenizer
 
             if radix_native_session:
+                # 'radix_native_session' servers a KV cache lifecycle and eviction hint.
+                # When 'tree_cache.ensure_session_generation(session_id)' runs, the
+                # Radix tree tracks which tree nodes belong to 'session_id'. If a user
+                # closes their chat window or clears their conversation, the server can
+                # invalidate or demote the priority of all Radix tree nodes tagged with
+                # that 'session_id' without touching other users' cached prefixes.
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     recv_req.session_id
                 )
 
             if is_beam:
+                # Beam search is currently not supported for many modes, so check if
+                # this request can use beam search.
                 error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
                 if error_msg:
                     logger.error(error_msg)
+                    # 'prepare_abort' sets 'finished_reason' to 'FINISH_ABORT'
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
                     return
@@ -3005,6 +3069,10 @@ class Scheduler(
         ):
             # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
+            # With session, the request does not need to send full prompt. It only needs
+            # to send the delta, and the engine reconstructs prompt from the current
+            # session. However, this has a drawback that if a worker node fails, all the
+            # existing session info is lost.
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
@@ -3014,12 +3082,18 @@ class Scheduler(
                 req_factory=partial(self._create_generation_req, recv_req),
             )
             if self.enable_session_radix_cache:
+                # This has the same effect as the 'ensure_session_generation' above. We
+                # just use the legacy 'session_id' here.
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     session_id
                 )
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
+            # BUG: 'create_req' performs parameter validation, which can abort the
+            # request if its paramaters are invalid. However, 'create_req' uses
+            # 'set_finish_with_abort' to abort request, which sets the 'to_finish' field
+            # not 'finished_reason'.
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -3043,6 +3117,8 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
+            # NOTE: Not sure why we queue an already aborted request, it's better to
+            # abort the request directly.
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
@@ -3188,6 +3264,17 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # NOTE: 'logprob_start_len' can affect 'RadixCache'. Suppose the RadixCache
+        # already has all $5,000$ tokens of a system prompt cached in GPU KV memory.
+        # - If 'return_logprob=False' (or 'logprob_start_len == 5000'): SGLang gets a
+        # 4,999-token prefix cache hit and only runs a 1-token prefill forward pass to
+        # sample the next token.
+        # - If the user asks for prompt logprobs ('return_logprob=True' and
+        # 'logprob_start_len = 0'): The RadixCache only stores K and V tensors, NOT the
+        # final-layer hidden states or logits! Therefore, to compute the prompt logprobs
+        # from index 0, SGLang must artificially clamp the RadixCache prefix match down
+        # to logprob_start_len and recompute the forward pass over the cached tokens
+        # just to regenerate their logits!
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1
@@ -3454,7 +3541,14 @@ class Scheduler(
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
+        # If 'enable_priority_scheduling' is true, enable priority scheduling. Requests
+        # with higher priority integer values will be scheduled first by default.
+        # However, if 'schedule_low_priority_values_first' is true, the scheduler will
+        # schedule requests with lower priority integer values first.
         if self.enable_priority_scheduling and req.priority is None:
+            # When priority scheduling is active, any request that omits a priority is
+            # demoted to the absolute lowest possible priority so that every explicitly
+            # prioritized request runs ahead of it.
             if self.schedule_low_priority_values_first:
                 req.priority = sys.maxsize
             else:
@@ -3472,6 +3566,10 @@ class Scheduler(
                     "message": "Using priority is disabled for this server. Please send a new request without a priority.",
                 },
             )
+            # NOTE: The error handling mechanism in SGLang is not very consistent. Some
+            # aborted requests still go through the scheduler's queue while some bypass.
+            # In addition, an already aborted request can still go through this code
+            # path, which aborts already-aborted request with a different reason.
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
@@ -3506,6 +3604,8 @@ class Scheduler(
                 item[1].time_stats.wait_queue_entry_time,
             )
             idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
+            # If there is some request in the waiting queue that has lower priority than
+            # the current request, abort it instead of this one.
             abort_existing_req = (
                 direction * recv_req.priority < direction * candidate_req.priority
             )
@@ -3513,6 +3613,7 @@ class Scheduler(
                 self._release_aborted_request(candidate_req)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
+                # Override the 'req_to_abort' and abort 'message'.
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -3538,6 +3639,7 @@ class Scheduler(
         aborts: List[AbortReq] = []
 
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
+            # Abort requests that missed their admission deadlines.
             deadline = time.perf_counter() - timeout_s
             for req in self.waiting_queue:
                 entry_time = req.time_stats.wait_queue_entry_time
@@ -3555,6 +3657,7 @@ class Scheduler(
                     )
 
         if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
+            # Abort requests that exceed their timeout limit.
             deadline = time.perf_counter() - timeout_s
             inflight_batches = self._collect_inflight_batches()
             seen_rids = set()
@@ -3568,6 +3671,8 @@ class Scheduler(
                         or req.finished()
                         or req.to_finish is not None
                     ):
+                        # Since `running_batch` and `last batch` may overlap,
+                        # we need this check.
                         continue
                     seen_rids.add(req.rid)
                     if 0 < req.time_stats.forward_entry_time < deadline:
@@ -3873,6 +3978,13 @@ class Scheduler(
             and last_batch
             and last_batch.forward_mode.is_extend()
         ):
+            # NOTE: 'is_extend' covers both pure 'EXTEND' and 'MIXED' batches.
+            # 1. Pure EXTEND: move newly completed prefill requests to the running
+            #    decode batch.
+            # 2. MIXED: move decode requests back to the running decode batch. For this
+            #    operation to work, when scheduling a mixed decode + prefill batch, we
+            #    need to clear the running decode batch so that we can move them back to
+            #    here.
             if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
@@ -3883,6 +3995,8 @@ class Scheduler(
 
             # Filter batch
             last_bs = last_batch.batch_size()
+            # Filter out finished requests in the last batch and compact their
+            # corresponding GPU tensors.
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
@@ -3891,6 +4005,10 @@ class Scheduler(
             # DP attention converted to extend is last_batch itself: filtered
             # in place above, nothing to merge.
             if not last_batch.is_empty() and last_batch is not running_batch:
+                # NOTE: If 'running_batch' is empty, it holds stale/desynced tensors
+                # from 'filter_batch'. Overwrite the reference instead of calling
+                # 'merge_batch' to avoid concatenating stale GPU tensors and skip
+                # redundant 'torch.cat'.
                 if running_batch.is_empty():
                     running_batch = last_batch
                 else:
@@ -3902,6 +4020,23 @@ class Scheduler(
         running_bs = running_batch.batch_size()
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
+            # In non-overlap scheduling mode, prefill-only requests can never slip into
+            # the running decode batch since after its forward pass,
+            # 'process_batch_result_prefill' runs immediately in the same iteration,
+            # extracts the embeddings, and sets the 'finished_reason' field for every
+            # request. On the next iteration, 'filter_batch' filters out these finished
+            # requests, so nothing gets merged into 'running_batch'.
+            # However, in overlap scheduling mode, the scheduler delays processing
+            # result of batch T, so when scheduling batch T + 1, it does not see these
+            # requests as finished, so it moves all requests from last batch into the
+            # running decode batch. Those finished requests are now sitting inside
+            # 'running_batch' like "zombies" as they will never enter
+            # 'update_running_batch' (which is where normal decode requests get filtered
+            # out). If traffic stops ('last_batch is None'), they would sit inside
+            # 'running_batch' forever, making /v1/loads report non-zero
+            # 'num_running_reqs' on an idle server!
+            # Hence, at iteration T + 2, we need to filter out finished prefill-only
+            # requests from iteration T.
             running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
@@ -3970,10 +4105,20 @@ class Scheduler(
         running_batch: Optional[ScheduleBatch] = None,
         num_held_rows: int = 0,
     ) -> int:
+        # Calculate how many new prefill requests can be safely admitted from
+        # 'waiting_queue' without exhausting request slots—either in the current
+        # microbatch ('pp_budget') or in the global GPU page table ('req_to_token_pool')
+
+        # pp_max_micro_batch_size = max_running_requests // pp_size
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         # Rows the counted requests may occupy: the free rows, plus the rows that
         # counted requests already hold (a continuing chunk, a session borrow),
         # minus the rows promised to beam members.
+
+        # req_to_token_pool is a 2D GPU tensor of shape [max_reqs, max_context_len]
+        # where each active sequence gets 1 row (req_pool_idx) to track its physical KV
+        # cache locations. self.req_to_token_pool.available_size() returns how many free
+        # rows are currently left in that global pool.
         active_batch = running_batch or self.running_batch
         row_budget = max(
             self.req_to_token_pool.available_size()
@@ -4028,6 +4173,9 @@ class Scheduler(
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
+            # The scheduler will evict lower-priority decode requests from running_batch
+            # and pushes them back into waiting_queue to make room for the high-priority
+            # prefill requests.
             running_batch.batch_is_full = False
         if running_batch.is_empty():
             # An empty batch has no request left to leave, and only a leaving
@@ -4037,10 +4185,27 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            # NOTE: SGLang prioritizes prefill only as long as the GPU has physical
+            # memory capacity to hold the newly prefilled requests during their
+            # subsequent decode phase. Once 'running_batch' hits the GPU's memory
+            # ceiling ('batch_is_full = True'), prefill must pause so 'running_batch'
+            # can run decode steps to completion and free up memory.
+            # However, 'chunked_req' already owns its logical budget reservation during
+            # admission, and physical KV page allocation chunk-by-chunk, so we want to
+            # finish its prefill phase as soon as possible and move it to decode phase.
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
+        # MinFreeSlotsDelayer prevents the scheduler from constantly interrupting active
+        # decode steps to prefill new requests one by one whenever running_batch is
+        # operating near its maximum capacity.
+        # Instead of admitting a single new request the instant 1 decode slot opens up,
+        # it forces the scheduler to wait until at least min_free_slots (e.g., 4 or 8
+        # slots) have freed up, and then prefills all of them together in a single
+        # batched pass. We don't want to defer a large decode batch just to run a single
+        # prefill request since doing this will increase the Inter-Token Latency (ITL)
+        # for decode.
         if (
             self.min_free_slots_delayer is not None
             and self.chunked_req is None
@@ -4065,6 +4230,7 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
+        # Sort the 'waiting_queue' by priority.
         self.policy.calc_priority(
             self.waiting_queue,
             running_batch,
@@ -4174,6 +4340,8 @@ class Scheduler(
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
+                    # If priority preemption is enabled, try to evict decode requests to
+                    # make room for higher priority prefill requests.
                     break
 
             if self.enable_hicache_storage or self.enable_lmcache:
@@ -4399,6 +4567,7 @@ class Scheduler(
         """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
 
+        # Filter out finished requests.
         finishing_reqs = self._reqs_finishing_inflight(batch)
         batch.filter_batch(reqs_to_exclude=finishing_reqs)
         if batch.is_empty():
@@ -5537,6 +5706,7 @@ class Scheduler(
 
     def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
         if get_parallel().pp_size == 1:
+            # `running_batch` and `last batch` may overlap.
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
@@ -5548,6 +5718,8 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                # If the chunk request is aborted, it may not be safe to abort it
+                # immediately, so record it here.
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -5559,6 +5731,10 @@ class Scheduler(
         to_del = []
         for i, req in enumerate(self.waiting_queue):
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                # Note that we use 'startswith' instead of exact equality to find
+                # matching requests to abort. This is because when a client sends a
+                # request with parallel sampling or uses beam search, 'TokenizerManager'
+                # generates multiple child requests sharing the exact same root ID:
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting

@@ -23,6 +23,18 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerInputBlocker:
+    """
+    In reinforcement learning (RLHF / PPO / GRPO) or co-located architectures
+    (e.g., Megatron + SGLang running on the same cluster):
+    1. The engine alternates between Rollout Phase (SGLang generating
+    trajectories) and Training / Weight Update Phase (Megatron updating model
+    weights or NCCL gradient syncs).
+    2. While weights are being updated, LoRA adapters swapped, or memory pools
+    reorganized, the scheduler must not admit new user requests into the
+    execution pipeline.
+    3. If an incoming prompt slips in mid-update, the forward pass will execute
+    against partially written weights or invalid memory pointers.
+    """
     def __init__(self, noop: bool):
         self._state = _State.UNBLOCKED
         self._pending_reqs = []
@@ -50,6 +62,8 @@ class SchedulerInputBlocker:
             return output_reqs
 
     def _handle_recv_req(self, recv_req):
+        # The state of SchedulerInputBlocker dynamically changes based on new
+        # requests.
         if isinstance(recv_req, BlockReqInput):
             if recv_req.req_type == BlockReqType.BLOCK:
                 self._execute_block_req()

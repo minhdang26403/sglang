@@ -256,7 +256,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
     # Some fields to allow people to override the server args
     # and launch processes for their private forks.
-    server_args_class: ServerArgs = ServerArgs
+    # Technically, this annotation is slightly inaccurate. Because server_args_class holds the class itself rather than an instance of the class, strict typing in Python would usually write this as : type[ServerArgs]
+    server_args_class: type[ServerArgs] = ServerArgs
     init_tokenizer_manager_func: Callable = staticmethod(init_tokenizer_manager)
     run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
     run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
@@ -1257,6 +1258,14 @@ class Engine(EngineScoreMixin, EngineBase):
             if threading.current_thread() is threading.main_thread():
 
                 def sigterm_handler(signum, frame):
+                    # When a cluster shuts down, container orchestrators often broadcast
+                    # SIGTERM to all pods simultaneously.
+                    # - If Node 1 immediately terminated on SIGTERM, its local GPU processes
+                    # would drop dead while Node 0 was still attempting to coordinate a
+                    # clean drain, causing broken pipe exceptions and CUDA IPC errors.
+                    # - Node 1 intercepts SIGTERM and keeps waiting so that Node 0 remains
+                    # the sole authority for orchestrating a coordinated, graceful shutdown
+                    # across all DP/TP ranks.
                     logger.warning(
                         f"SIGTERM received on node_rank {get_parallel().node_rank}; "
                         "waiting for the rank-0 ShutdownReq broadcast to stop "

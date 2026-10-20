@@ -27,7 +27,6 @@ from multiprocessing.connection import Connection, wait
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_rank_to_dp_rank,
@@ -216,6 +215,8 @@ class DataParallelController:
             f"--dp ({self.launch_dp_size})."
         )
 
+        # Track whether a worker slot has physically booted, joined the cluster,
+        # and had its IPC/TCP communication channels established.
         self.dp_active: list[bool] = [True] * self.launch_dp_size + [False] * (
             self.max_dp_size - self.launch_dp_size
         )
@@ -234,6 +235,8 @@ class DataParallelController:
         self.scheduler_procs = []
         self.local_kv_event_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
+        # Track whether an admitted worker is currently healthy and capable of
+        # executing forward passes right now.
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
@@ -269,6 +272,9 @@ class DataParallelController:
                 sock_send(worker, obj)
 
     def send_control_message(self, obj):
+        # Every worker is an attention DP group leader.
+        # With step=1, we slice all active DP slots: [DP 0, DP 1, DP 2, DP 3].
+        # Sends the ZeroMQ command directly to GPU 0, GPU 2, GPU 4, GPU 6 (all leaders).
         for i in self._active_workers[:: self.control_message_step]:
             worker = self.workers[i]
             if worker is not None:
@@ -284,6 +290,8 @@ class DataParallelController:
                     self.max_dp_size,
                 )
                 return
+            # Update the worker's status based on its provision status and
+            # current health.
             self.status = [
                 self.dp_active[i] and bool(ranks.status[i])
                 for i in range(self.max_dp_size)
@@ -299,6 +307,9 @@ class DataParallelController:
             )
             return
         self.status = list(ranks.status)
+        # BUG: Need to refresh active workers after status update.
+        # TODO: Unify the two branches to refresh active workers and update the status list
+        self._refresh_active_workers()
 
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
@@ -322,6 +333,8 @@ class DataParallelController:
                 f"[Elastic EP] add_elastic_workers: slot {slot} was not "
                 f"pre-bound at launch; expected a primary-bound PUSH socket."
             )
+            # dp_active list is only updated once when an elastic worker joins
+            # the cluster.
             self.dp_active[slot] = True
             self.status[slot] = True
 
@@ -335,6 +348,8 @@ class DataParallelController:
         )
 
     def _refresh_active_workers(self) -> None:
+        # dense index list of all workers that are currently eligible to
+        # receive traffic
         self._active_workers = [
             i for i, active in enumerate(self.dp_active) if active and self.status[i]
         ]
@@ -420,6 +435,9 @@ class DataParallelController:
         threads = []
         sockets = []
         ready_events = []
+        # This code only works for one node. If we ever try to enable DataParallelController
+        # for multiple nodes, each node will spawn its own separate DP replicas, which means
+        # that we have up to `num_nodes * num_dp_ranks` replicas.
         for dp_rank in range(get_parallel().num_dp_ranks):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
@@ -446,6 +464,8 @@ class DataParallelController:
             )
 
             if get_parallel().node_rank == 0:
+                # Since SGLang only supports vanilla DP on single node, this code
+                # always runs since `node_rank` is always 0.
                 self.workers[dp_rank] = get_zmq_socket(
                     self.context,
                     zmq.PUSH,
@@ -496,6 +516,8 @@ class DataParallelController:
             List of worker ports (same on all nodes after broadcast).
         """
         is_joiner = get_exec().moe.is_ep_scale_joiner
+        # TODO: delete `is_joiner` here. It's wrong for the elastic EP joiner
+        # to use 127.0.0.1.
         if get_parallel().dist_init_addr is None or is_joiner:
             na = NetworkAddress(
                 get_serving().host or "127.0.0.1",
@@ -551,9 +573,16 @@ class DataParallelController:
             logger.debug("Worker port broadcast completed")
             return worker_ports
         finally:
+            # This `finally` block runs before this function exits in any case,
+            # normal or abnormal.
             if get_exec().moe.elastic_ep_backend is None:
+                # If the cluster is in static mode, close the rep_socket after
+                # broadcasting worker ports to all other nodes.
                 rep_socket.close()
             else:
+                # Elastic EP Cluster: hands the open rep_socket over to a
+                # dedicated background daemon thread to publish the pre-bound
+                # worker-port list.
                 threading.Thread(
                     target=self._reply_ports_as_server,
                     args=(rep_socket, handshake),
@@ -611,8 +640,11 @@ class DataParallelController:
         self, server_args: ServerArgs, port_args: PortArgs
     ):
         if get_parallel().dist_init_addr is None:
+            # Single node DP attention only
             bind_host = "127.0.0.1"
         else:
+            # For multi-node DP attention, we pass in the address of the master
+            # node that is known to other node.
             bind_host = NetworkAddress.parse(get_parallel().dist_init_addr).host
 
         worker_ports = []
@@ -748,17 +780,19 @@ class DataParallelController:
                     + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
                 )
                 # Derive the child's EP rank for its display label.
-                moe_ep_rank = (
-                    tp_rank
-                    % (get_parallel().tp_size // get_parallel().moe_dp_size)
-                    // (
-                        get_parallel().tp_size
-                        // get_parallel().moe_dp_size
-                        // get_parallel().ep_size
-                    )
-                )
+                # moe_size is the number of ranks in one MoE Data Parallel replica.
+                moe_size = get_parallel().tp_size // get_parallel().moe_dp_size
+                # moe_tp_size is the number of GPUs sharing one individual expert.
+                moe_tp_size = moe_size // get_parallel().ep_size
+                # (tp_rank % moe_size) removes the MoE-DP replica offset, mapping the
+                # global TP rank to its local index inside its MoE replica group.
+                # divides by moe_tp_size to extract which expert this GPU owns.
+                moe_ep_rank = tp_rank % moe_size // moe_tp_size
 
                 # Scheduler internals use local ranks; logs use global ranks.
+                # Since SGLang supports elastic MoE scaling, we use `offset` to
+                # shift the display labels into a contiguous global range while
+                # leaving local mathematical indices untouched.
                 offset = get_parallel().ep_join_rank_offset
                 dp_offset = physical_ep_rank_to_dp_rank(offset, self.attn_replica_size)
                 display_tp_rank = tp_rank + offset
@@ -858,19 +892,26 @@ class DataParallelController:
         active = self._active_workers
         if not active:
             raise RuntimeError("No active DP workers are available for routing.")
-        attempts = 0
-        while attempts < len(active):
-            slot = active[self.round_robin_counter % len(active)]
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
-            if self.status[slot]:
-                logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
-                return
-            attempts += 1
-        raise RuntimeError(
-            f"Cannot route request: all {len(active)} active DP workers "
-            "are unavailable."
-        )
+        # We don't need this block. Since _active_workers list is strictly kept
+        # in sync with the `status` list, every worker in `_active_workers` is
+        # available for routing.
+        # attempts = 0
+        # while attempts < len(active):
+        #     slot = active[self.round_robin_counter % len(active)]
+        #     self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
+        #     if self.status[slot]:
+        #         logger.debug(f"Choose worker {slot}")
+        #         sock_send(self.workers[slot], req)
+        #         return
+        #     attempts += 1
+        # raise RuntimeError(
+        #     f"Cannot route request: all {len(active)} active DP workers "
+        #     "are unavailable."
+        # )
+
+        slot = active[self.round_robin_counter % len(active)]
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
+        sock_send(self.workers[slot], req)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -970,6 +1011,7 @@ def run_data_parallel_controller_process(
             init_info["kv_event_sources"] = sorted(
                 controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
             )
+        # When we reach here, all scheduler processes should be initialized.
         pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
         if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:

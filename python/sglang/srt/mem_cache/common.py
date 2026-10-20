@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
-
 from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
@@ -227,6 +226,11 @@ def match_kv_cache(
 ) -> MatchResult:
     """Match token_ids against tree_cache and adopt the hit as req's prefix."""
     if token_ids is None:
+        # For a brand-new request, 'req.output_ids' is empty, so 'token_ids' is just the
+        # prompt. If a request was preempted or retracted due to memory pressure, it
+        # already generated some tokens. Its new lookup key includes both its original
+        # prompt and the output tokens generated before it was retracted, allowing it to
+        # recover all of its previously computed KV cache!
         token_ids = req.origin_input_ids + req.output_ids
 
     match_result = tree_cache.match_prefix(
@@ -256,13 +260,24 @@ def match_kv_cache(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
+    # Max matched prefix len for this request given its parameters (logprob, dllm).
     max_len = req._compute_max_prefix_len(len(token_ids))
+    # Note that 'req.host_hit_length' does not include 'len(req.prefix_indices)'. It
+    # measures the extra, non-overlapping span of tokens found in CPU host memory that
+    # must be transferred from CPU to GPU.
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     # A probe match keeps what it did not report; a new round resets both.
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
+        # 'cache_protected_len' establishes a boundary between tree-owned (reusable and
+        # protected) KV pages and request-private (unaligned or in-flight) KV pages.
+        # If a prompt has 35 tokens and page_size = 16, tokens 0...31 occupy 2 complete
+        # physical pages while tokens 32...34 occupy a partial page. Therefore, SGLang
+        # sets 'cache_protected_len = 32'. Tokens 32...34 are private to this request.
+        # They live in the request's allocated GPU page, but the tree does not know about
+        # them.
         req.kv.cache_protected_len = match_result.cache_protected_len
     return match_result
 

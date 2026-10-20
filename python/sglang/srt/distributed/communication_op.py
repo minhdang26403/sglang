@@ -107,10 +107,13 @@ def attn_cp_tp_broadcast_pyobj(data: List[Any]) -> List[Any]:
     tp_group = get_attn_tp_group()
     cp_group = get_attn_cp_group()
     if cp_group.world_size > 1 and tp_group.rank_in_group == 0:
+        # Broadcast between ranks of CP group, which are leaders of their own
+        # TP group.
         data = broadcast_pyobj(
             data, cp_group.rank, cp_group.cpu_group, src=cp_group.ranks[0]
         )
     if tp_group.world_size > 1:
+        # Each attention TP leader broadcast within their own group.
         data = broadcast_pyobj(
             data, tp_group.rank, tp_group.cpu_group, src=tp_group.ranks[0]
         )

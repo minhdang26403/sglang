@@ -288,6 +288,10 @@ async def init_multi_tokenizer() -> ServerArgs:
     return server_args
 
 
+# This is the entry point for the HTTP server initialization. If we use
+# multi-tokenizer mode, multiple HTTP server processes will be created, so
+# multiple instances of `lifespan` will run concurrently to initialize
+# tokenizer worker.
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None

@@ -42,7 +42,6 @@ from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import msgspec
 import torch
-
 from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
 from sglang.srt.beam_search.fork import (
     MEMBER_LENGTH_MARGIN,
@@ -227,6 +226,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         gate subtracts this so it never over-commits the req slot pool."""
         if self._num_live_groups == 0:
             return 0
+
+        # Every unspawned beam group currently sitting in running_batch has already
+        # claimed 1 row, and will imminently claim beam_width - 1 more rows when decode
+        # starts.
         return sum(
             r.beam_group.beam_width - 1
             for r in batch.reqs
