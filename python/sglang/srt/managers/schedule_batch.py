@@ -481,7 +481,11 @@ class Req(ReqDllmMixin):
         # Input and output info
         self.rid = rid
         self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
+        # The prompt tokens with any image tokens expanded into hundreds of
+        # patch tokens.
         self.origin_input_ids = origin_input_ids
+        # The raw prompt tokens before image expansion. Note that for text-only
+        # requests, this field is the same as 'self.origin_input_ids'.
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded
@@ -494,7 +498,10 @@ class Req(ReqDllmMixin):
         self.output_ids = array("q")
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
-        # extend_end, never mutates this array's length.
+        # extend_range, never mutates this array's length.
+        # A C-level buffer that holds the entire sequence ('origin_input_ids' +
+        # 'output_ids' generated during decode) used by the scheduler during
+        # batch building.
         self.full_untruncated_fill_ids = array("q")
         # This round extends fill ids [prefix_len, extend_end).
         self.extend_end: Optional[int] = None
@@ -613,8 +620,14 @@ class Req(ReqDllmMixin):
         # on the path to last_node; the next extend starts at prefix_len.
         self.prefix_len: int = 0
         # TODO(ispobock): rename to last_device_node
+        # The terminal node representing the longest matched prefix found in device
+        # memory
         self.last_node: Any = None
+        # The terminal node representing the longest matched prefix found in host memory
         self.last_host_node: Any = None
+        # The deepest node in the tree matching the request prompt across any tier
+        # (Device, Host L2, or Storage L3). HiCache uses this as the target anchor for
+        # background prefetch pipelines.
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
@@ -1220,6 +1233,7 @@ class Req(ReqDllmMixin):
         ):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
+            # Force recomputation instead of retrieving from KV cache to return logprob.
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         if self.is_dllm():
             # Appended masks and a partial prompt/output block are not reusable
@@ -1437,6 +1451,10 @@ class Req(ReqDllmMixin):
 
     def request_finish(self, reason: BaseFinishReason) -> None:
         """Finish with reason at the request's next commit."""
+        # Only records a finish reason here. `update_finish_state` will consume this
+        # field and set the final `finished_reason`. This delayed finish is necessary
+        # since the request may still go through an extra forward pass due to overlap
+        # scheduling.
         self.to_finish = reason
 
     def request_discard(self, reason: FINISH_ABORT) -> None:
@@ -2000,6 +2018,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
+    # This tensor contains the token IDs to be forwarded in the current step. This field
+    # is only set for DECODE batch.
     input_ids: torch.Tensor = None  # shape: [b], int64
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
@@ -2025,7 +2045,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     engram_staged_rows: Optional[StagedRows] = None
     encoder_swa_reset: Optional[List[bool]] = None
 
+    # The row indices in 'req_to_token_pool' (the page table mapping each request to its
+    # KV cache tokens).
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
+    # Current sequence lengths of each surviving request.
     seq_lens: torch.Tensor = None  # shape: [b], int64
 
     # The original sequence lengths, Qwen-1M related
@@ -3339,6 +3362,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         strip_beam_tail(self)
         if keep_indices is None:
+            # If 'keep_indices' is not provided (default), only keep requests that are
+            # not finished yet or not in the exclude set.
             if isinstance(reqs_to_exclude, Req):
                 reqs_to_exclude = [reqs_to_exclude]
             elif reqs_to_exclude is None:
@@ -3349,10 +3374,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if not self.reqs[i].finished() and self.reqs[i] not in reqs_to_exclude
             ]
 
+        # NOTE: no need to check for 'None' again here.
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests. Stale tensors are left as-is: is_empty()
             # keys off reqs, so callers drop the batch before a forward reads them.
+            # Setting 'self.reqs' to empty list is enough since 'batch.is_empty()'
+            # checks the len of 'self.reqs'. Once 'self.reqs' is empty, the scheduler
+            # discards the 'ScheduleBatch' object entirely, and Python's garbage
+            # collector automatically frees all the stale tensors.
             self.reqs = []
+            # We may not need to reset these fields since the batch will be dropped
+            # anyway.
             self.return_hidden_states = False
             self.return_hidden_states_mode = CaptureHiddenMode.NULL
             return
@@ -3361,6 +3393,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # No need to filter
             return
 
+        # PyTorch allocates a page-locked (pinned) host buffer, fills it with
+        # 'keep_indices', allocates an uninitialized GPU buffer ('keep_indices_device'),
+        # and enqueues an asynchronous 'cudaMemcpyAsync' (H2D DMA copy) command onto the
+        # current active CUDA stream.
+        # Because 'non_blocking=True', the CPU thread does not wait for the PCIe
+        # transfer to finish. It returns the 'keep_indices_device' Python Tensor wrapper
+        # immediately.
         keep_indices_device = torch.tensor(
             keep_indices,
             dtype=torch.int64,
@@ -3371,13 +3410,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens = self.encoder_lens[keep_indices_device]
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
+        # Keep only requests in 'keep_indices'
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
+
+        # At this point, the 'keep_indices_device' may not be fully materialized on the
+        # GPU yet. To dispatch 'tensor[index_tensor]', PyTorch only needs the metadata
+        # of keep_indices_device (its shape, stride, dtype, and GPU pointer)—all of
+        # which already exist on the CPU! It does not inspect the integer values inside
+        # the GPU memory.
+        # PyTorch allocates the output GPU tensor and enqueues an asynchronous
+        # index_select / gather CUDA kernel onto the exact same CUDA stream, right
+        # behind the 'cudaMemcpyAsync' command.
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+
+        # 'out_cache_loc' holds the physical KV cache slots written in the previous
+        # forward pass. The next forward pas will allocate brand-new KV cache slots
+        # anyway, so slicing the old ones is wasted work.
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3418,6 +3471,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [req.sampling_params.top_k for req in self.reqs]
         )
         if self.spec_info:
+            # If speculative decoding is active, slices the per-request draft token
+            # trees and hidden states to match the surviving requests.
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 new_indices_cpu=keep_indices,

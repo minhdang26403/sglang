@@ -15,8 +15,6 @@ from typing import (
 
 import torch
 import zmq
-from torch.distributed import ReduceOp, all_reduce, barrier
-
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
@@ -48,6 +46,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
 )
+from torch.distributed import ReduceOp, all_reduce, barrier
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -134,13 +133,18 @@ class SchedulerRequestReceiver:
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if get_parallel().pp_rank == 0:
+            # Pipeline parallel root.
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
+                # Leader of the DP group.
                 recv_reqs = []
 
                 # Rust ringbuffer backend: drain the in-process ring fed by the
                 # embedded Rust TokenizerManager instead of a zmq socket. Same
                 # non-blocking, msgpack-decoded contract as the zmq path below.
                 if self.rust_server_mode:
+                    # Note: call the `drain` method from the Rust server since
+                    # the Python Tokenizer process and IPC sockets are replaced
+                    # by an embedded Rust `TokenizerManager`.
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )
@@ -150,6 +154,8 @@ class SchedulerRequestReceiver:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
+                        # Regular tokenized prompt inputs
+                        # (TokenizedGenerateReqInput) from Tokenizer.
                         recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
@@ -159,6 +165,9 @@ class SchedulerRequestReceiver:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
+                        # High-priority out-of-band administrative messages
+                        # (aborts sent from the FastAPI server, health checks,
+                        # profiling triggers, cache flush commands).
                         recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
@@ -166,12 +175,16 @@ class SchedulerRequestReceiver:
             else:
                 recv_reqs = None
         else:
+            # Pipeline parallel downstream stages.
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
+                # Use dp_offset to convert the local rank to global rank.
                 dp_offset = (
                     get_parallel().attn_dp_rank
                     * get_parallel().attn_cp_size
                     * get_parallel().attn_tp_size
                 )
+                # Uses PyTorch Gloo on the host CPU (self.world_group.cpu_group) to
+                # transfer Python request objects from stage P-1 to P.
                 recv_reqs = point_to_point_pyobj(
                     [],
                     get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
@@ -223,6 +236,8 @@ class SchedulerRequestReceiver:
             recv_reqs = work_reqs + control_reqs
         else:
             if recv_reqs is not None:
+                # local_reqs let other TP ranks know which requests to abort.
+                # The abort decision must be dictated by the leader scheduler.
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
@@ -236,6 +251,8 @@ class SchedulerRequestReceiver:
                         recv_reqs, exchange=exchange, tp_group=tp_group
                     )
                 else:
+                    # Broadcast requests to all remaining TP ranks in the group. Each
+                    # scheduler should make identical scheduling decision.
                     recv_reqs = broadcast_pyobj(
                         recv_reqs,
                         tp_group.rank,
@@ -259,6 +276,8 @@ class SchedulerRequestReceiver:
 
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode
+        # - MM: Multi-Modal
+        # - EPD: Encoder-Prefill-Decode
         if (
             get_parallel().pp_rank == 0
             and get_disagg().language_only

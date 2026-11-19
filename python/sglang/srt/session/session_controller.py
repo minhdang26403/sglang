@@ -24,6 +24,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    SessionParams,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import Req
@@ -45,6 +46,10 @@ class Session:
     ):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
+        # Streaming session is an optimization specifically designed for strictly
+        # linear, append-only workloads (like feeding chunks of a live audio/text stream
+        # or sequential agent steps). Therefore, we don't need to keep tree of history
+        # or allow modifcation in streaming mode.
         self.streaming = streaming
         self.timeout = timeout
         self.last_active_time: float = time.monotonic()
@@ -67,12 +72,18 @@ class Session:
     @staticmethod
     def _strip_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
         """Trim a leading BOS on an appended turn; shift mm offsets to match."""
+        # BOS stands for Beginning of Sentence: <s>, <|begin_of_text|>, <bos>.
         if not (
             tokenizer is not None
             and req.input_ids
             and req.input_ids[0] == tokenizer.bos_token_id
         ):
             return
+        # Since the first turn already contains BOS, we trim the BOS of the second turn:
+        # Turn 1 ("Hello"):           [BOS, "Hello"]
+        # Turn 2 ("What about C++?"): [BOS, "What", "about", "C++", "?"]
+        # The combine sequence would become:
+        # [BOS, "Hello", "Hi there!", BOS, "What", "about", "C++", "?"]
         req.input_ids = req.input_ids[1:]
         if req.mm_inputs:
             for item in req.mm_inputs.mm_items:
@@ -82,6 +93,8 @@ class Session:
                             "mm_item offset starts at 0 (BOS position), "
                             "clamping to 0 after BOS strip"
                         )
+                    # image placeholder in a prompt spans (start, end) offsets,
+                    # so we need to shift it left by one.
                     item.offsets = [
                         (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
                     ]
@@ -96,15 +109,25 @@ class Session:
         new input. Returns (input_ids, input_ids_unpadded, carry_fill);
         carry_fill (== the new origin) spares the first fill_ids rebuild.
         """
+        # Due to overlap scheduling and speculative decoding, the engine may generate
+        # some extra trailing tokens past 'max_new_tokens', so we need to trim the
+        # output.
         out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
 
+        # Trim both the padded input and unpadded input to the last committed len.
+        # REFACTOR: This version is clearer.
         input_ids = last_req.origin_input_ids
+        input_ids_unpadded = last_req.origin_input_ids_unpadded
         del input_ids[self.committed_origin_len :]
-        if last_req.origin_input_ids_unpadded is input_ids:
-            input_ids_unpadded = input_ids
-        else:
-            input_ids_unpadded = last_req.origin_input_ids_unpadded
+        if input_ids_unpadded is not input_ids:
             del input_ids_unpadded[self.committed_unpadded_len :]
+
+        # del input_ids[self.committed_origin_len :]
+        # if last_req.origin_input_ids_unpadded is input_ids:
+        #     input_ids_unpadded = input_ids
+        # else:
+        #     input_ids_unpadded = last_req.origin_input_ids_unpadded
+        #     del input_ids_unpadded[self.committed_unpadded_len :]
 
         carry_fill = last_req.full_untruncated_fill_ids
         if (
@@ -114,9 +137,20 @@ class Session:
         ):
             # Unexpected type or aliased with an origin array (extending it
             # below would double-append): let refresh_fill_ids rebuild.
+            # Not sure how this case can ever happen, but for safety, set 'carry_fill'
+            # to None to avoid double append.
             carry_fill = None
         else:
+            # Truncate the array to the last committed len first.
             del carry_fill[self.committed_fill_len :]
+            # 'baked' is the number of output tokens already baked into 'carry_fill'.
+            # For example:
+            # - input_ids = [10, 20, 30]
+            # - carry_fill = [10, 20, 30, 901, 902]
+            # - out_tail = [901, 902, 903]
+            # In this case, 'baked = 2' since two output tokens are already appended to
+            # the 'carry_fill' array, so we just need to extend
+            # 'out_tail[2:] = 903'.
             baked = len(carry_fill) - len(input_ids)
             if 0 <= baked <= len(out_tail):
                 carry_fill.extend(out_tail[baked:])
@@ -124,20 +158,30 @@ class Session:
             else:
                 carry_fill = None
 
+        # Notice that out_tail (last_req's output) is only appended into input_ids
+        # when the NEXT turn starts!
+        # So if that next turn aborts, input_ids currently contains
+        # [last_req's input] + [last_req's output (out_tail)] + [aborted turn's new_input_ids]
         input_ids.extend(out_tail)
         input_ids.extend(new_input_ids)
         if input_ids_unpadded is not input_ids:
             input_ids_unpadded.extend(out_tail)
             input_ids_unpadded.extend(new_input_ids)
+
+        # At this point, 'input_ids' and 'carry_fill' have the same content. However,
+        # 'input_ids' is strictly immutable while 'carry_fill' is an append-only working
+        # buffer.
         return input_ids, input_ids_unpadded, carry_fill
 
     @staticmethod
     def _concat_token_arrays(
-        last_req: Req, req: TokenizedGenerateReqInput, session_params
+        last_req: Req, req: TokenizedGenerateReqInput, session_params: SessionParams
     ):
         """Copy-based assembly for non-streaming turns."""
         out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
 
+        # OPT: We should do 'input_ids = last_req.origin_input_ids + out_tail'
+        # only when 'drop_previous_output' is false.
         input_ids = last_req.origin_input_ids + out_tail
         if session_params.drop_previous_output:
             input_ids = last_req.origin_input_ids[:]
@@ -146,10 +190,18 @@ class Session:
         else:
             input_ids += req.input_ids
 
+        # BUG: 'input_ids_unpadded' and 'input_ids' are two different Python list
+        # objects. For should check for alias before performing this object allocation.
         input_ids_unpadded = last_req.origin_input_ids_unpadded + out_tail
         if session_params.drop_previous_output:
             input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
         if session_params.offset and session_params.offset != 0:
+            # In a text-only model, 'input_ids' and 'input_ids_unpadded' have identical
+            # lengths, so slicing at offset cuts at the exact same token. However, in a
+            # multi-modal request, applying the exact same integer offset to both arrays
+            # would slice them at completely different semantic positions.
+            # In practice, offset is designed for text-based editing and is not intended
+            # to slice across multi-modal image blocks.
             input_ids_unpadded = (
                 input_ids_unpadded[: session_params.offset] + req.input_ids
             )
@@ -181,20 +233,27 @@ class Session:
         elif self.streaming:
             # Streaming sessions: only simple appends allowed; reject otherwise.
             if self._inflight:
+                # Only one request from the current session can run at a time.
                 abort = True
                 abort_message = "Streaming session already has an active request."
             elif session_params.drop_previous_output:
+                # Need to keep everything in streaming mode.
                 abort = True
                 abort_message = (
                     "Streaming sessions do not support drop_previous_output."
                 )
             elif session_params.offset and session_params.offset != 0:
+                # No tree to branch out.
                 abort = True
                 abort_message = "Streaming sessions do not support offset."
             elif self.turns:
                 assert len(self.turns) == 1
                 # Peek (don't pop) the single turn. turns is updated
                 # only in finish_req after the request completes successfully.
+                # Streaming sessions keep only one turn (`Req`), which contains all the
+                # chat history. We don't need multiple turns since we don't support
+                # branching, so we fold each completed turn into the single entry in
+                # `self.turns`.
                 [last_req] = self.turns.values()
         else:
             if session_params.rid is not None:
@@ -216,6 +275,9 @@ class Session:
             # finished, and the committed_* lengths recorded by finish_req let
             # _share_token_arrays trim away tokens appended by an aborted turn.
             # offset / drop_previous_output rewrite history and must copy.
+            # REFACTOR: We don't need to check for 'drop_previous_output' and 'offset'.
+            # The above checks already cover this. 'committed_origin_len' is updated
+            # once a streaming request finishes.
             can_share_token_arrays = (
                 self.streaming
                 and self.committed_origin_len is not None
@@ -223,6 +285,7 @@ class Session:
                 and not (session_params.offset and session_params.offset != 0)
             )
             if can_share_token_arrays:
+                # Reuse the two input lists and output buffer of the previous request.
                 input_ids, input_ids_unpadded, carry_fill = self._share_token_arrays(
                     last_req, req.input_ids
                 )
@@ -231,6 +294,7 @@ class Session:
                     last_req, req, session_params
                 )
         else:
+            # No existing history for this session, use the current prompt as is.
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
 
@@ -285,24 +349,36 @@ class Session:
             new_req.full_untruncated_fill_ids = carry_fill
 
         if abort:
+            # Set the request's status to abort to let the scheduler handle it.
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
             self.last_active_time = time.monotonic()
             # turns is NOT updated here; finish_req() handles it.
             self._inflight = True
         else:
+            # Non-streaming mode registers nodes eagerly at creation time, whereas
+            # streaming mode registers nodes lazily upon successful completion (see
+            # 'finish_req')
             self.last_active_time = time.monotonic()
+            # Note that 'session_params.rid' is used to identify which node to continue
+            # from or replace while 'req.rid' is the current (new) request ID.
             self.turns[req.rid] = new_req
 
         return new_req
 
     def finish_req(self, req):
         """Update turns after a streaming request finishes successfully."""
+        # NOTE: This method is strictly and exclusively designed for streaming mode.
         self._inflight = False
         if self.turns:
+            # This unpack operation requires 'req_nodes.values()' to contain exactly one
+            # item.
             [prev_req] = self.turns.values()
             prev_req.session = None
             self.turns.clear()
+        # In streaming mode, we defer deleting the last request node and creating new
+        # request node to guarantee abort safety. If we delete the last node and abort
+        # mid-way, 'req_nodes' only contains the aborted node.
         self.turns[req.rid] = req
         # Confirm this req's token arrays as the session's rollback point.
         self.committed_origin_len = len(req.origin_input_ids)

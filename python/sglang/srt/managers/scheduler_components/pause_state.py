@@ -39,13 +39,22 @@ class PauseState:
         """Queue `received` after the held inputs and return the ones to dispatch
         now: all of them, or with `stop_at_pause` those before the first pause,
         which stays held with everything after it."""
+        # Add newly polled requests to the list of pending requests. These requests may
+        # be blocked by a pause request at the head of the list.
         self._held_inputs.extend(received)
         num_to_dispatch = len(self._held_inputs)
         if stop_at_pause:
+            # When 'stop_at_pause=True', the scheduler processes everything up to, but
+            # excluding, the first pause generation request, leaving that pause request
+            # and all subsequent requests parked inside 'self._held_inputs'. When the
+            # scheduler reaches a clean scheduling boundary, 'take_inputs' will be
+            # invoked with 'stop_at_pause=False', and all requests in this list will be
+            # drained.            
             for index, req in enumerate(self._held_inputs):
                 if isinstance(req, PauseGenerationReqInput):
                     num_to_dispatch = index
                     break
+        # Only process requests before the first pause generation request.
         to_dispatch = self._held_inputs[:num_to_dispatch]
         del self._held_inputs[:num_to_dispatch]
         return to_dispatch

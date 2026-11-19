@@ -380,10 +380,13 @@ class SchedulerMetricsReporter:
             and get_parallel().attn_tp_rank == 0
             and get_parallel().pp_rank == get_parallel().pp_size - 1
         ):
+            # Only the attention-TP rank 0 that is also the last rank in the pipeline
+            # reports metrics.
             from sglang.srt.observability.forward_pass_metrics import (
                 _FpmPublisherThread,
             )
 
+            # Each DP replica has its own FPM publisher.
             self.scheduler._fpm_dp_rank = (
                 get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
             )
@@ -399,6 +402,7 @@ class SchedulerMetricsReporter:
                     forward_pass_metrics_ipc_name=base_endpoint,
                 )
             endpoint = f"{base_endpoint}.{self.scheduler._fpm_dp_rank}"
+            # Create a background thread to publish forward pass metrics.
             self.scheduler._fpm_publisher = _FpmPublisherThread(
                 endpoint,
                 worker_id=self.scheduler._fpm_worker_id,
@@ -407,6 +411,8 @@ class SchedulerMetricsReporter:
             if self.forward_pass_device_timer is None:
                 self.forward_pass_device_timer = DeviceTimer()
             self.scheduler.enable_fpm = True
+            # Wrap the 'run_batch' function to time it and attach the timing result to
+            # the forward pass's result.
             self.scheduler.run_batch = wrap_forward_with_fpm(
                 self.scheduler.run_batch, self.forward_pass_device_timer
             )
